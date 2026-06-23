@@ -190,7 +190,7 @@ std::size_t match_csv_pattern(const std::uint8_t* data, std::size_t len,
         if (consumed < len && data[consumed] == '=') {
             while (consumed < len) {
                 const std::uint8_t c = data[consumed];
-                if (c == ' ' || c == '\n' || c == '\0') {
+                if (c == ' ' || c == '\n' || c == ',' || c == '\0') {
                     break;
                 }
                 consumed++;
