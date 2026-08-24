@@ -264,14 +264,14 @@ boot_img::~boot_img() {
 
 struct __attribute__((packed)) fdt_header {
     struct fdt32_t {
-        uint32_t byte0 : 8;
-        uint32_t byte1 : 8;
-        uint32_t byte2 : 8;
-        uint32_t byte3 : 8;
+        uint8_t byte0;
+        uint8_t byte1;
+        uint8_t byte2;
+        uint8_t byte3;
 
         constexpr operator uint32_t() const {
-            return (static_cast<uint32_t>(byte3) << 24) | (static_cast<uint32_t>(byte2) << 16) |
-                   (static_cast<uint32_t>(byte1) << 8) | static_cast<uint32_t>(byte0);
+            return (static_cast<uint32_t>(byte0) << 24) | (static_cast<uint32_t>(byte1) << 16) |
+                   (static_cast<uint32_t>(byte2) << 8) | static_cast<uint32_t>(byte3);
         }
     };
 
@@ -293,26 +293,44 @@ struct __attribute__((packed)) fdt_header {
 };
 
 static int find_dtb_offset(const uint8_t* buf, unsigned sz) {
+    // Linux's empty_root.dts produces a 132-byte placeholder.
+    constexpr uint32_t min_non_empty_dtb_size = 0x84;
     const uint8_t* const end = buf + sz;
 
-    for (auto curr = buf; curr < end; curr += sizeof(fdt_header)) {
+    for (auto curr = buf; end - curr >= static_cast<ptrdiff_t>(sizeof(fdt_header)); curr += 4) {
         curr =
             static_cast<uint8_t*>(memmem(curr, end - curr, DTB_MAGIC, sizeof(fdt_header::fdt32_t)));
         if (curr == nullptr)
+            return -1;
+        if (end - curr < static_cast<ptrdiff_t>(sizeof(fdt_header)))
             return -1;
 
         auto fdt_hdr = reinterpret_cast<const fdt_header*>(curr);
 
         uint32_t totalsize = fdt_hdr->totalsize;
-        if (totalsize > end - curr || totalsize <= 0x48)
+        if (totalsize > end - curr || totalsize <= min_non_empty_dtb_size)
+            continue;
+
+        uint32_t version = fdt_hdr->version;
+        uint32_t last_compatible = fdt_hdr->last_comp_version;
+        if (version < 16 || last_compatible > 17 || last_compatible > version)
             continue;
 
         uint32_t off_dt_struct = fdt_hdr->off_dt_struct;
-        if (off_dt_struct > end - curr)
+        uint32_t off_dt_strings = fdt_hdr->off_dt_strings;
+        uint32_t off_mem_rsvmap = fdt_hdr->off_mem_rsvmap;
+        if (off_dt_struct < sizeof(fdt_header) || (off_dt_struct & 3U) != 0 ||
+            off_dt_struct > totalsize - 16 || off_dt_strings < sizeof(fdt_header) ||
+            off_dt_strings > totalsize || fdt_hdr->size_dt_strings > totalsize - off_dt_strings ||
+            off_mem_rsvmap < sizeof(fdt_header) || (off_mem_rsvmap & 7U) != 0 ||
+            off_mem_rsvmap > totalsize - 16)
+            continue;
+        if (version >= 17 &&
+            (fdt_hdr->size_dt_struct < 16 || fdt_hdr->size_dt_struct > totalsize - off_dt_struct))
             continue;
 
         auto fdt_node_hdr = reinterpret_cast<const fdt_header::node_header*>(curr + off_dt_struct);
-        if (fdt_node_hdr->tag != 0x1u)
+        if (fdt_node_hdr->tag != 0x1u || curr[off_dt_struct + sizeof(fdt_header::fdt32_t)] != '\0')
             continue;
 
         return curr - buf;
