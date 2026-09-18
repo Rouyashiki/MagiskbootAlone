@@ -32,8 +32,21 @@ FILE* boot_info_stream() {
 #define RETURN_CHROMEOS 2
 #define RETURN_VENDOR 3
 
-static void decompress(FileFormat type, int fd, const void* in, size_t size) {
-    decompress_bytes(type, byte_view{in, size}, fd);
+static bool decompress_to_file(FileFormat type, const void* in, size_t size, const char* filename,
+                               int dirfd = AT_FDCWD) {
+    bool success = false;
+    {
+        owned_fd fd(xopenat(dirfd, filename, O_CREAT | O_TRUNC | O_WRONLY | O_CLOEXEC, 0644));
+        if (fd < 0)
+            return false;
+        success =
+            decompress_bytes(type, byte_view{in, size}, [&fd](const uint8_t* data, size_t len) {
+                return xwrite(fd, data, len) == static_cast<ssize_t>(len);
+            });
+    }
+    if (!success)
+        unlinkat(dirfd, filename, 0);
+    return success;
 }
 
 static off_t compress_len(FileFormat type, byte_view in, int fd) {
@@ -742,9 +755,8 @@ int split_image_dtb(Utf8CStr filename, bool skip_decomp) {
 
         FileFormat fmt = check_fmt_lg(img.data(), img.size());
         if (!skip_decomp && fmt_compressed(fmt)) {
-            int fd = creat(KERNEL_FILE, 0644);
-            decompress(fmt, fd, img.data(), off);
-            close(fd);
+            if (!decompress_to_file(fmt, img.data(), off, KERNEL_FILE))
+                return RETURN_ERROR;
         } else {
             dump(img.data(), off, KERNEL_FILE);
         }
@@ -765,9 +777,8 @@ int unpack(Utf8CStr image, bool skip_decomp, bool hdr) {
     // Dump kernel
     if (!skip_decomp && fmt_compressed(boot.k_fmt)) {
         if (boot.hdr->kernel_size() != 0) {
-            int fd = creat(KERNEL_FILE, 0644);
-            decompress(boot.k_fmt, fd, boot.kernel, boot.hdr->kernel_size());
-            close(fd);
+            if (!decompress_to_file(boot.k_fmt, boot.kernel, boot.hdr->kernel_size(), KERNEL_FILE))
+                return RETURN_ERROR;
         }
     } else {
         dump(boot.kernel, boot.hdr->kernel_size(), KERNEL_FILE);
@@ -788,20 +799,22 @@ int unpack(Utf8CStr image, bool skip_decomp, bool hdr) {
                 ssprintf(file_name, sizeof(file_name), "%.*s.cpio",
                          static_cast<int>(it.ramdisk_name.size()), it.ramdisk_name.data());
             }
-            owned_fd fd =
-                owned_fd(xopenat(dirfd, file_name, O_CREAT | O_TRUNC | O_WRONLY | O_CLOEXEC, 0644));
             FileFormat fmt = check_fmt_lg(boot.ramdisk + it.ramdisk_offset, it.ramdisk_size);
             if (!skip_decomp && fmt_compressed(fmt)) {
-                decompress(fmt, fd, boot.ramdisk + it.ramdisk_offset, it.ramdisk_size);
+                if (!decompress_to_file(fmt, boot.ramdisk + it.ramdisk_offset, it.ramdisk_size,
+                                        file_name, dirfd))
+                    return RETURN_ERROR;
             } else {
+                owned_fd fd(
+                    xopenat(dirfd, file_name, O_CREAT | O_TRUNC | O_WRONLY | O_CLOEXEC, 0644));
                 xwrite(fd, boot.ramdisk + it.ramdisk_offset, it.ramdisk_size);
             }
         }
     } else if (!skip_decomp && fmt_compressed(boot.r_fmt)) {
         if (boot.hdr->ramdisk_size() != 0) {
-            int fd = creat(RAMDISK_FILE, 0644);
-            decompress(boot.r_fmt, fd, boot.ramdisk, boot.hdr->ramdisk_size());
-            close(fd);
+            if (!decompress_to_file(boot.r_fmt, boot.ramdisk, boot.hdr->ramdisk_size(),
+                                    RAMDISK_FILE))
+                return RETURN_ERROR;
         }
     } else {
         dump(boot.ramdisk, boot.hdr->ramdisk_size(), RAMDISK_FILE);
@@ -813,9 +826,8 @@ int unpack(Utf8CStr image, bool skip_decomp, bool hdr) {
     // Dump extra
     if (!skip_decomp && fmt_compressed(boot.e_fmt)) {
         if (boot.hdr->extra_size() != 0) {
-            int fd = creat(EXTRA_FILE, 0644);
-            decompress(boot.e_fmt, fd, boot.extra, boot.hdr->extra_size());
-            close(fd);
+            if (!decompress_to_file(boot.e_fmt, boot.extra, boot.hdr->extra_size(), EXTRA_FILE))
+                return RETURN_ERROR;
         }
     } else {
         dump(boot.extra, boot.hdr->extra_size(), EXTRA_FILE);
