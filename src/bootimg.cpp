@@ -1,10 +1,11 @@
+#include <cstdio>
+#include <cstdlib>
 #include <functional>
 #include <memory>
 #include <stdexcept>
 #include <string_view>
 #include <vector>
-#include <cstdlib>
-#include <cstdio>
+#include <zlib.h>
 
 #include "base_host.hpp"
 #include "boot_crypto.hpp"
@@ -78,6 +79,28 @@ static bool guess_lzma(const uint8_t* buf, size_t len) {
     return true;
 }
 
+static bool check_xz(const uint8_t* buf, size_t len) {
+    if (len < 12 || !BUFFER_MATCH(buf, XZ_MAGIC) || buf[6] != 0 || (buf[7] & 0xf0) != 0)
+        return false;
+    const uint8_t check_id = buf[7];
+    if (check_id != 0 && check_id != 1 && check_id != 4 && check_id != 10)
+        return false;
+    const uint32_t expected = static_cast<uint32_t>(buf[8]) | (static_cast<uint32_t>(buf[9]) << 8) |
+                              (static_cast<uint32_t>(buf[10]) << 16) |
+                              (static_cast<uint32_t>(buf[11]) << 24);
+    return crc32(0, buf + 6, 2) == expected;
+}
+
+static bool check_gzip(const uint8_t* buf, size_t len) {
+    return (len >= 10 && BUFFER_MATCH(buf, GZIP1_MAGIC) && buf[2] == 8 && (buf[3] & 0xe0) == 0) ||
+           (len >= sizeof(GZIP2_MAGIC) - 1 && BUFFER_MATCH(buf, GZIP2_MAGIC));
+}
+
+static bool check_bzip2(const uint8_t* buf, size_t len) {
+    return len >= 10 && BUFFER_MATCH(buf, BZIP_MAGIC) && buf[3] >= '1' && buf[3] <= '9' &&
+           memcmp(buf + 4, "\x31\x41\x59\x26\x53\x59", 6) == 0;
+}
+
 FileFormat check_fmt(const void* buf, size_t len) {
     const uint8_t* b = static_cast<const uint8_t*>(buf);
     if (len >= (sizeof(CHROMEOS_MAGIC) - 1) && BUFFER_MATCH(b, CHROMEOS_MAGIC)) {
@@ -86,16 +109,15 @@ FileFormat check_fmt(const void* buf, size_t len) {
         return FileFormat::AOSP;
     } else if (len >= (sizeof(VENDOR_BOOT_MAGIC) - 1) && BUFFER_MATCH(b, VENDOR_BOOT_MAGIC)) {
         return FileFormat::AOSP_VENDOR;
-    } else if ((len >= (sizeof(GZIP1_MAGIC) - 1) && BUFFER_MATCH(b, GZIP1_MAGIC)) ||
-               (len >= (sizeof(GZIP2_MAGIC) - 1) && BUFFER_MATCH(b, GZIP2_MAGIC))) {
+    } else if (check_gzip(b, len)) {
         return FileFormat::GZIP;
     } else if (len >= (sizeof(LZOP_MAGIC) - 1) && BUFFER_MATCH(b, LZOP_MAGIC)) {
         return FileFormat::LZOP;
-    } else if (len >= (sizeof(XZ_MAGIC) - 1) && BUFFER_MATCH(b, XZ_MAGIC)) {
+    } else if (check_xz(b, len)) {
         return FileFormat::XZ;
     } else if (guess_lzma(b, len)) {
         return FileFormat::LZMA;
-    } else if (len >= (sizeof(BZIP_MAGIC) - 1) && BUFFER_MATCH(b, BZIP_MAGIC)) {
+    } else if (check_bzip2(b, len)) {
         return FileFormat::BZIP2;
     } else if ((len >= (sizeof(LZ41_MAGIC) - 1) && BUFFER_MATCH(b, LZ41_MAGIC)) ||
                (len >= (sizeof(LZ42_MAGIC) - 1) && BUFFER_MATCH(b, LZ42_MAGIC))) {
@@ -425,14 +447,21 @@ const uint8_t* boot_img::parse_hdr(const uint8_t* addr, FileFormat type) {
 }
 
 void boot_img::parse_zimage() {
+    const size_t kernel_size = hdr->kernel_size();
+    if (kernel_size < sizeof(zimage_hdr))
+        return;
     z_info.hdr = reinterpret_cast<const zimage_hdr*>(kernel);
 
     const uint8_t* piggy = nullptr;
-    for (const uint8_t* curr = kernel + 0x28; curr < kernel + hdr->kernel_size(); curr++) {
-        if (check_fmt_lg(curr, hdr->kernel_size() - (curr - kernel)) != FileFormat::UNKNOWN) {
-            piggy = curr;
-            break;
+    for (size_t step : {size_t{4}, size_t{1}}) {
+        for (size_t offset = 0x28; offset < kernel_size; offset += step) {
+            if (fmt_compressed(check_fmt_lg(kernel + offset, kernel_size - offset))) {
+                piggy = kernel + offset;
+                break;
+            }
         }
+        if (piggy != nullptr)
+            break;
     }
 
     if (piggy != nullptr) {
@@ -442,9 +471,13 @@ void boot_img::parse_zimage() {
         uint32_t piggy_size = z_info.hdr->end - z_info.hdr->start;
         uint32_t piggy_end = piggy_size;
         uint32_t offsets[16];
+        if (z_info.hdr->end < z_info.hdr->start || piggy_size < sizeof(offsets) ||
+            piggy_size > kernel_size)
+            return;
         memcpy(offsets, kernel + piggy_size - sizeof(offsets), sizeof(offsets));
+        const uint32_t min_tail = piggy_size > 0xFF ? piggy_size - 0xFF : 0;
         for (int i = 15; i >= 0; --i) {
-            if (offsets[i] > (piggy_size - 0xFF) && offsets[i] < piggy_size) {
+            if (offsets[i] > min_tail && offsets[i] > z_info.hdr_sz && offsets[i] < piggy_size) {
                 piggy_end = offsets[i];
                 break;
             }
