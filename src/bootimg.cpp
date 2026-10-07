@@ -841,6 +841,7 @@ void repack(Utf8CStr src_img, Utf8CStr out_img, bool skip_comp) {
         uint32_t extra;
         uint32_t dtb;
         uint32_t tail;
+        uint32_t eof;
         uint32_t vbmeta;
     } off{};
 
@@ -1082,6 +1083,8 @@ void repack(Utf8CStr src_img, Utf8CStr out_img, bool skip_comp) {
         file_align();
     }
 
+    off.tail = lseek(fd, 0, SEEK_CUR);
+
     // Proprietary stuffs
     if (boot.flags[SEANDROID_FLAG]) {
         xwrite(fd, SEANDROID_MAGIC, 16);
@@ -1092,11 +1095,9 @@ void repack(Utf8CStr src_img, Utf8CStr out_img, bool skip_comp) {
         xwrite(fd, LG_BUMP_MAGIC, 16);
     }
 
-    off.tail = lseek(fd, 0, SEEK_CUR);
+    off.eof = lseek(fd, 0, SEEK_CUR);
     fprintf(stdout, "repack: tail at %u\n", off.tail);
     fflush(stderr);
-    file_align();
-
     // vbmeta
     if (boot.flags[AVB_FLAG]) {
         // According to avbtool.py, if the input is not an Android sparse image
@@ -1126,13 +1127,14 @@ void repack(Utf8CStr src_img, Utf8CStr out_img, bool skip_comp) {
         fflush(stderr);
     }
 
-    if (off.tail < off.header) {
+    if (off.tail < off.header || off.eof < off.tail) {
         fprintf(stdout, "repack: invalid layout tail=%u < header=%u\n", off.tail, off.header);
         delete hdr;
         close(fd);
         return;
     }
     uint32_t aosp_img_size = off.tail - off.header;
+    uint32_t orig_img_size = off.eof - off.header;
 
     off_t file_sz = lseek(fd, 0, SEEK_END);
     if (file_sz <= 0) {
@@ -1259,7 +1261,7 @@ void repack(Utf8CStr src_img, Utf8CStr out_img, bool skip_comp) {
         }
         AvbFooter footer;
         memcpy(&footer, boot.avb_footer, sizeof(footer));
-        footer.original_image_size = __builtin_bswap64(aosp_img_size);
+        footer.original_image_size = __builtin_bswap64(orig_img_size);
         footer.vbmeta_offset = __builtin_bswap64(off.vbmeta);
         if (pwrite(fd, &footer, sizeof(footer), static_cast<off_t>(out_sz - sizeof(AvbFooter))) !=
             static_cast<ssize_t>(sizeof(footer))) {
@@ -1279,13 +1281,13 @@ void repack(Utf8CStr src_img, Utf8CStr out_img, bool skip_comp) {
     }
 
     if (boot.flags[DHTB_FLAG]) {
-        std::vector<char> dhtb_payload(aosp_img_size + 16 + 4);
-        ssize_t nr = pread(fd, dhtb_payload.data(), dhtb_payload.size(),
-                           static_cast<off_t>(sizeof(dhtb_hdr)));
+        std::vector<char> dhtb_payload(orig_img_size);
+        ssize_t nr =
+            pread(fd, dhtb_payload.data(), dhtb_payload.size(), static_cast<off_t>(off.header));
         if (nr == static_cast<ssize_t>(dhtb_payload.size())) {
             dhtb_hdr d_hdr;
             memcpy(&d_hdr, boot.map.data(), sizeof(d_hdr));
-            d_hdr.size = aosp_img_size + 16 + 4;
+            d_hdr.size = orig_img_size;
             sha256_hash(byte_view(dhtb_payload.data(), d_hdr.size),
                         byte_data(d_hdr.checksum.data(), SHA256_DIGEST_SIZE));
             if (pwrite(fd, &d_hdr, sizeof(d_hdr), 0) != static_cast<ssize_t>(sizeof(d_hdr))) {
