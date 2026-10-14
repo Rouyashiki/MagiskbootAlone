@@ -111,7 +111,7 @@ bool check(bool condition, const char* expression, int line) {
         }                                                                   \
     } while (false)
 
-CpioDataSource source_from(std::string value) {
+auto source_from(std::string value) {
     return [value = std::move(value), offset = std::size_t{0}](
                std::uint8_t* output, std::size_t capacity) mutable -> ssize_t {
         const std::size_t count = std::min(capacity, value.size() - offset);
